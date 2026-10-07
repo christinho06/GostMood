@@ -1,0 +1,19 @@
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# JavaScript dependencies (not used by the application; ignored if present locally)
+node_modules/
+**/node_modules/
+
+# Build outputs and editor metadata
+**/dist/
+.DS_Store
+.vscode/
