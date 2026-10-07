@@ -23,6 +23,9 @@ SERVICE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
 db: Client | None = None
 if SUPABASE_URL and SERVICE_KEY:
     db = create_client(SUPABASE_URL, SERVICE_KEY)
+user_auth: Client | None = None
+if SUPABASE_URL and ANON_KEY:
+    user_auth = create_client(SUPABASE_URL, ANON_KEY)
 
 app = FastAPI(title='GostMood Creative Lab API', version='2.0.0')
 origins = [value.strip() for value in os.getenv('CORS_ORIGINS', 'http://localhost:8000').split(',') if value.strip()]
@@ -98,9 +101,9 @@ def camel(record: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def auth_client():
-    if not SUPABASE_URL or not ANON_KEY:
+    if user_auth is None:
         raise HTTPException(503, 'Configurez SUPABASE_URL et SUPABASE_ANON_KEY dans apps/backend/.env')
-    return create_client(SUPABASE_URL, ANON_KEY)
+    return user_auth
 
 
 async def current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -214,20 +217,45 @@ def login(body: dict[str, Any]):
         raise HTTPException(422, 'Vous devez accepter la politique de confidentialité pour vous connecter.')
     try:
         response = auth_client().auth.sign_in_with_password({'email': body.get('email', ''), 'password': body.get('password', '')})
-        if not response.user or not response.session:
-            raise HTTPException(401, 'Email ou mot de passe incorrect')
-        profile = rows('profiles', filters={'id': response.user.id}, limit=1)
-        if not profile:
-            raise HTTPException(401, 'Profil introuvable')
-        accepted_profile = update('profiles', response.user.id, {
-            'privacy_accepted_at': datetime.now(timezone.utc).isoformat(),
-            'privacy_policy_version': str(body.get('privacyPolicyVersion') or '2026-10-07'),
-        })
-        return auth_result(accepted_profile, response.session)
-    except HTTPException:
-        raise
     except Exception:
         raise HTTPException(401, 'Email ou mot de passe incorrect')
+    if not response.user or not response.session:
+        raise HTTPException(401, 'Email ou mot de passe incorrect')
+
+    try:
+        profile = rows('profiles', filters={'id': response.user.id}, limit=1)
+    except Exception as exc:
+        raise HTTPException(503, f'Connexion réussie, mais le profil Supabase est inaccessible : {exc}')
+    if not profile:
+        raise HTTPException(503, 'Connexion réussie, mais aucun profil correspondant n’existe. Vérifiez le trigger profiles de schema.sql.')
+
+    accepted_at = datetime.now(timezone.utc).isoformat()
+    policy_version = str(body.get('privacyPolicyVersion') or '2026-10-07')
+    try:
+        accepted_profile = update('profiles', response.user.id, {
+            'privacy_accepted_at': accepted_at,
+            'privacy_policy_version': policy_version,
+        })
+    except Exception as exc:
+        # Existing Supabase projects may not have re-run the schema migration yet.
+        # In that case keep login working and persist the consent in trusted Auth app metadata.
+        message = str(exc).lower()
+        missing_consent_columns = ('privacy_accepted_at' in message or 'privacy_policy_version' in message) and ('42703' in message or 'column' in message or 'schema cache' in message)
+        if not missing_consent_columns or db is None:
+            raise HTTPException(503, f'Connexion réussie, mais impossible d’enregistrer le consentement : {exc}')
+        try:
+            auth_record = db.auth.admin.get_user_by_id(response.user.id).user
+            app_metadata = dict(auth_record.app_metadata or {}) if auth_record else {}
+            app_metadata['privacy_consent'] = {'acceptedAt': accepted_at, 'policyVersion': policy_version}
+            db.auth.admin.update_user_by_id(response.user.id, {'app_metadata': app_metadata})
+            accepted_profile = {
+                **profile[0],
+                'privacy_accepted_at': accepted_at,
+                'privacy_policy_version': policy_version,
+            }
+        except Exception as fallback_exc:
+            raise HTTPException(503, f'Connexion réussie, mais le consentement ne peut pas être enregistré. Exécutez apps/backend/schema.sql dans Supabase. Détail : {fallback_exc}')
+    return auth_result(accepted_profile, response.session)
 
 
 @app.post('/api/auth/refresh')
